@@ -1,0 +1,174 @@
+---
+title: "Lab 6 Part 1"
+subtitle: "ESM 244"
+author: "Roupen Khanjian"
+date: "Winter 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse) # Easily Install and Load the 'Tidyverse', CRAN v1.3.0
+library(here) # A Simpler Way to Find Your Files, CRAN v1.0.1
+library(janitor) # Simple Tools for Examining and Cleaning Dirty Data, CRAN v2.1.0
+library(sf) # Simple Features for R, CRAN v0.9-7
+library(tmap) # Thematic Maps, CRAN v3.3
+
+# for kriging function
+library(gstat) # Spatial and Spatio-Temporal Geostatistical Modelling, Prediction and Simulation, CRAN v2.0-6
+
+# make grid of new locations
+library(stars) # Spatiotemporal Arrays, Raster and Vector Data Cubes, CRAN v0.5-1
+```
+
+# Read in data
+
+```{r}
+
+ca_dgw <- read_sf(here("ca_dgw"), layer = "F2013_DBGS_Points_20150720_093252") %>%
+  clean_names()
+
+# some negative values which means well is above sea level
+
+# check the projections
+st_crs(ca_dgw) # wgs 84
+
+# read in CA county data
+ca_counties <- read_sf(here("ca_counties"), layer = "CA_Counties_TIGER2016") %>% 
+  clean_names() %>% 
+  select(name) # geometry is sticky so it still shows up here
+
+# check the projections
+st_crs(ca_counties)
+
+ca_counties <- st_transform(ca_counties, st_crs(ca_dgw)) # can list the number or the crs from another sf object
+
+# make a quick plot
+
+ggplot() +
+  geom_sf(data = ca_counties) +
+  geom_sf(data = ca_dgw, aes(color = dgbs))
+
+```
+
+# map interactively to explore furthur
+
+```{r}
+
+tmap_mode("view")
+
+tm_shape(ca_dgw) +
+  tm_dots("dgbs") # dots means its a point plot
+
+```
+
+## san joaquin county
+
+```{r}
+# only choose sj county
+sj_county <-  ca_counties %>% 
+  filter(name == "San Joaquin")
+
+# keep obs for groundwater depth within that county
+sj_depth <- ca_dgw %>% 
+  st_intersection(sj_county) # intersection between dgw data and sj county
+
+plot(sj_depth)
+plot(sj_county)
+
+ggplot() +
+  geom_sf(data = sj_county) +
+  geom_sf(data = sj_depth, aes(color = dgbs))
+
+# take a look at what patterns we see before any analysis
+# looks like smaller ones are in the western part, while the depths increases as we move east
+# not changing this data want to predcit what its gonna look like
+
+```
+
+# check for duplicates aka spatial singularties
+
+cant have 2 observations at the same exact location with different values
+
+can get rid of duplicates, or get the mean values of them
+
+```{r}
+
+well_duplicates <- sj_depth %>% 
+  get_dupes(latitude, longitude) # wow what a function! check for duplicates
+
+well_duplicates
+
+# in the future probably take the average between the dupliocates
+
+sj_depth <- sj_depth %>% 
+  filter(!local_well %in% well_duplicates$local_well)  # get rid of dupes
+
+sj_depth %>% 
+  get_dupes(latitude, longitude) # no more dupes!
+```
+
+# make a variogram!
+
+```{r}
+
+sj_dgw_vgm <- variogram(dgbs ~ 1, data = sj_depth)
+
+plot(sj_dgw_vgm)
+# Looks variogramish! Increasing variance as observations get further apart.
+# but want to have countinuos function
+
+sj_dgw_vgm_fit <- fit.variogram(sj_dgw_vgm, model = 
+                                  vgm(nugget = 20, # nugget
+                                      psill = 3000, # sill, no further increase in semivariance
+                                      model = "Gau", # Gaussian
+                                      range = 30) # range, distance at which no longer correlation 
+                                ) 
+
+# Plot them together:
+plot(sj_dgw_vgm, sj_dgw_vgm_fit) 
+
+sj_dgw_vgm_fit
+# gives the estimate for the psill, nugget and range
+# nugget = 102.3049
+# psill = 2843.7017
+# range = 17.18188
+
+# how dependency changes while we move away from a point
+```
+
+# Spatial kriging (interpolation)
+
+```{r}
+# first make a grid over which well krige:
+
+sj_grid <- st_bbox(sj_county) %>%  # find lat and long limits 
+  st_as_stars(dx = 0.01, dy = 0.01) %>% # diff in x and y between points, increase the dx/dy, makes it less fine
+  st_set_crs(4326) %>% 
+  st_crop(sj_county) # crop this grid to the outline of what you put
+
+plot(sj_grid) # cool!
+sj_grid
+
+sj_dgw_krige <- krige(dgbs ~ 1, sj_depth, sj_grid, model = sj_dgw_vgm_fit)
+
+# Initial plot of kriging outcome: 
+plot(sj_dgw_krige) # prediction of what the dg is,plots the predicted values
+```
+
+
+```{r}
+# Convert it to a spatial data frame
+krige_df <- as.data.frame(sj_dgw_krige) %>% 
+  st_as_sf(coords = c("x","y")) %>% 
+  drop_na(var1.pred)
+
+st_crs(krige_df) <- 4326
+
+# Then we can use ggplot: 
+ggplot(data = krige_df) +
+  geom_sf(aes(color = var1.pred)) +
+  scale_color_gradient(low = "blue", high = "yellow") # woah
+```
+
+
